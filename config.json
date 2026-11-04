@@ -1,0 +1,18 @@
+{
+  "grid": {"columns": 3, "rows": 3},
+  "camera_index": 0,
+  "blink_threshold": 0.19,
+  "blink_debounce_ms": 1200,
+  "discord": {"webhook_url": ""},
+  "buttons": [
+    {"label": "안녕하세요", "color": "#2563eb", "action": {"type": "sound", "text": "안녕하세요"}},
+    {"label": "네", "color": "#0891b2", "action": {"type": "sound", "text": "네"}},
+    {"label": "아니요", "color": "#7c3aed", "action": {"type": "sound", "text": "아니요"}},
+    {"label": "도와주세요", "color": "#dc2626", "action": {"type": "sound", "text": "도와주세요"}},
+    {"label": "물 주세요", "color": "#059669", "action": {"type": "sound", "text": "물 주세요"}},
+    {"label": "화장실", "color": "#d97706", "action": {"type": "sound", "text": "화장실"}},
+    {"label": "Discord 전송", "color": "#5865f2", "action": {"type": "discord", "message": "사용자가 도움을 요청합니다."}},
+    {"label": "소리", "color": "#4f46e5", "action": {"type": "sound", "text": "알림"}},
+    {"label": "잠시 쉴게요", "color": "#475569", "action": {"type": "sound", "text": "잠시 쉴게요"}}
+  ]
+}
