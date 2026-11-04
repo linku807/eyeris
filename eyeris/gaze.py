@@ -7,7 +7,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import median
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +21,7 @@ class GazeSample:
     message: str = "카메라 연결 대기 중"
     head_yaw: float | None = None
     head_pitch: float | None = None
+    features: tuple[float, ...] | None = None
 
 
 class GazeTracker:
@@ -67,24 +67,24 @@ class GazeTracker:
             return self._debug_image
 
     @staticmethod
-    def _eye_gaze(eye, iris) -> tuple[float, float]:
-        """Return iris position in an eye-local coordinate system."""
+    def _eye_gaze_3d(eye, iris) -> tuple[float, float]:
+        """Measure iris position in a 3D eye-local frame to reduce head-roll/perspective drift."""
         start, end = eye[0], eye[3]
-        horizontal = (end[0] - start[0], end[1] - start[1])
-        horizontal_length = horizontal[0] ** 2 + horizontal[1] ** 2
-        horizontal_ratio = 0.5
-        if horizontal_length > 1e-6:
-            offset = (iris[0] - start[0], iris[1] - start[1])
-            horizontal_ratio = (offset[0] * horizontal[0] + offset[1] * horizontal[1]) / horizontal_length
-
-        top = ((eye[1][0] + eye[2][0]) / 2, (eye[1][1] + eye[2][1]) / 2)
-        bottom = ((eye[5][0] + eye[4][0]) / 2, (eye[5][1] + eye[4][1]) / 2)
-        vertical = (bottom[0] - top[0], bottom[1] - top[1])
-        vertical_length = vertical[0] ** 2 + vertical[1] ** 2
-        vertical_ratio = 0.5
-        if vertical_length > 1e-6:
-            offset = (iris[0] - top[0], iris[1] - top[1])
-            vertical_ratio = (offset[0] * vertical[0] + offset[1] * vertical[1]) / vertical_length
+        horizontal = tuple(end[axis] - start[axis] for axis in range(3))
+        width = math.sqrt(sum(value * value for value in horizontal))
+        if width < 1e-7:
+            return 0.5, 0.5
+        horizontal_axis = tuple(value / width for value in horizontal)
+        top = tuple((eye[1][axis] + eye[2][axis]) / 2 for axis in range(3))
+        bottom = tuple((eye[5][axis] + eye[4][axis]) / 2 for axis in range(3))
+        vertical = tuple(bottom[axis] - top[axis] for axis in range(3))
+        projection = sum(vertical[axis] * horizontal_axis[axis] for axis in range(3))
+        vertical = tuple(vertical[axis] - projection * horizontal_axis[axis] for axis in range(3))
+        vertical_length_sq = sum(value * value for value in vertical)
+        if vertical_length_sq < 1e-9:
+            return 0.5, 0.5
+        horizontal_ratio = sum((iris[i] - start[i]) * horizontal_axis[i] for i in range(3)) / width
+        vertical_ratio = sum((iris[i] - top[i]) * vertical[i] for i in range(3)) / vertical_length_sq
         return horizontal_ratio, vertical_ratio
 
     @staticmethod
@@ -175,12 +175,14 @@ class GazeTracker:
                 wink_candidate_since: float | None = None
                 wink_eye: str | None = None
                 last_gaze: tuple[float, float] | None = None
+                last_features: tuple[float, ...] | None = None
                 while not self._stop.is_set():
                     ok, frame = camera.read()
                     if not ok:
                         wink_candidate_since = None
                         wink_eye = None
                         last_gaze = None
+                        last_features = None
                         if not frame_read_failed:
                             logger.warning("Camera %s stopped returning frames", self.camera_index)
                             frame_read_failed = True
@@ -198,6 +200,7 @@ class GazeTracker:
                         wink_candidate_since = None
                         wink_eye = None
                         last_gaze = None
+                        last_features = None
                         self._publish_debug_frame(cv2, frame, "얼굴을 찾는 중")
                         self._publish(GazeSample(message="얼굴을 찾는 중"))
                         continue
@@ -214,38 +217,62 @@ class GazeTracker:
                     right_iris = [point(i) for i in self.RIGHT_IRIS]
                     iris_left = (sum(p[0] for p in left_iris) / len(left_iris), sum(p[1] for p in left_iris) / len(left_iris))
                     iris_right = (sum(p[0] for p in right_iris) / len(right_iris), sum(p[1] for p in right_iris) / len(right_iris))
-                    left_gaze = self._eye_gaze(left_eye, iris_left)
+                    point3d = lambda index: (landmarks[index].x, landmarks[index].y, landmarks[index].z)
+                    left_eye_3d = [point3d(i) for i in self.LEFT_EYE]
+                    right_eye_3d = [point3d(i) for i in self.RIGHT_EYE]
+                    left_iris_3d = tuple(sum(point3d(i)[axis] for i in self.LEFT_IRIS) / len(self.LEFT_IRIS)
+                                         for axis in range(3))
+                    right_iris_3d = tuple(sum(point3d(i)[axis] for i in self.RIGHT_IRIS) / len(self.RIGHT_IRIS)
+                                          for axis in range(3))
+                    left_gaze = self._eye_gaze_3d(left_eye_3d, left_iris_3d)
                     # Both eye groups are ordered from image-left to image-right. Keep
                     # that common axis so the two eyes reinforce instead of canceling.
-                    right_gaze = self._eye_gaze(right_eye, iris_right)
+                    right_gaze = self._eye_gaze_3d(right_eye_3d, right_iris_3d)
                     left_ear, right_ear = self._ear(left_eye), self._ear(right_eye)
                     threshold = self.blink_threshold
+                    previous_wink_eye = wink_eye
                     wink_eye, wink_candidate_since, wink = self._update_wink(
                         left_ear, right_ear, threshold, wink_eye, wink_candidate_since, time.monotonic()
                     )
-                    if wink_eye is not None:
-                        # Keep the selected target stable while one eye is closing.
+                    gaze_features = None
+                    wink_transition = previous_wink_eye is not None and wink_eye is None
+                    if wink_eye is not None or wink_transition:
+                        # Keep both the gaze and model inputs fixed across closure/release frames.
                         if last_gaze is not None:
                             gaze_x, gaze_y = last_gaze
+                            gaze_features = last_features
                         else:
                             wink_gaze = right_gaze if wink_eye == "left" else left_gaze
                             gaze_x, gaze_y = 1.0 - wink_gaze[0], wink_gaze[1]
+                            gaze_features = (*wink_gaze, *wink_gaze)
+                            last_gaze = (gaze_x, gaze_y)
+                            last_features = gaze_features
                     else:
                         left_open = left_ear >= threshold
                         right_open = right_ear >= threshold
                         if left_open and right_open:
                             eye_gaze = ((left_gaze[0] + right_gaze[0]) / 2,
                                         (left_gaze[1] + right_gaze[1]) / 2)
+                            gaze_features = (
+                                left_gaze[0], left_gaze[1],
+                                right_gaze[0], right_gaze[1],
+                            )
                         elif left_open:
                             eye_gaze = left_gaze
+                            other_eye = last_features[2:4] if last_features else left_gaze
+                            gaze_features = (*left_gaze, *other_eye)
                         elif right_open:
                             eye_gaze = right_gaze
+                            other_eye = last_features[:2] if last_features else right_gaze
+                            gaze_features = (*other_eye, *right_gaze)
                         else:
                             last_gaze = None
+                            last_features = None
                             self._publish(GazeSample(message="눈을 뜨고 화면을 바라보세요"))
                             continue
                         gaze_x, gaze_y = 1.0 - eye_gaze[0], eye_gaze[1]
                         last_gaze = (gaze_x, gaze_y)
+                        last_features = gaze_features
                     gaze_x = min(1.25, max(-0.25, gaze_x))
                     gaze_y = min(1.25, max(-0.25, gaze_y))
                     debug_text = (
@@ -262,6 +289,7 @@ class GazeTracker:
                         gaze_x, gaze_y, wink,
                         head_yaw=head_pose[0] if head_pose else None,
                         head_pitch=head_pose[1] if head_pose else None,
+                        features=gaze_features,
                     ))
         except Exception as exc:  # Keep camera failures visible in the app instead of crashing Tk.
             logger.exception("Gaze tracking failed")
@@ -320,60 +348,112 @@ class GazeTracker:
 
 
 class GazeCalibration:
-    """Map eye-local gaze to screen coordinates with learned head-motion compensation."""
+    """Map separate left/right eye features to screen coordinates."""
 
     def __init__(self) -> None:
-        self.points: list[tuple[float, float, float, float, float, float]] = []
+        self.points: list[tuple[float, float, float, float]] = []
         self.mapping: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
-        self.head_reference = (0.0, 0.0)
-        self.head_coefficients_x = (0.0, 0.0)
-        self.head_coefficients_y = (0.0, 0.0)
-        self.head_compensated = False
+        self.feature_samples: list[tuple[tuple[float, ...], float, float]] = []
+        self.feature_mean: tuple[float, ...] = ()
+        self.feature_scale: tuple[float, ...] = ()
+        self.feature_mapping: tuple[tuple[float, ...], tuple[float, ...]] | None = None
 
-    def add(self, gaze_x: float, gaze_y: float, screen_x: float, screen_y: float,
-            head_yaw: float | None = None, head_pitch: float | None = None) -> bool:
-        self.points.append((gaze_x, gaze_y, head_yaw or 0.0, head_pitch or 0.0,
-                            screen_x, screen_y))
+    def add(self, gaze_x: float, gaze_y: float, screen_x: float, screen_y: float) -> bool:
+        self.points.append((gaze_x, gaze_y, screen_x, screen_y))
         return self._refit()
+
+    def add_feature_samples(self, samples: list[tuple[float, ...]],
+                            screen_x: float, screen_y: float) -> bool:
+        for features in samples:
+            if features and all(math.isfinite(value) for value in features):
+                self.feature_samples.append((tuple(features), screen_x, screen_y))
+        return self._fit_feature_mapping()
+
+    @staticmethod
+    def _solve_system(matrix: list[list[float]], target: list[float]) -> tuple[float, ...] | None:
+        size = len(target)
+        augmented = [matrix[row][:] + [target[row]] for row in range(size)]
+        for pivot in range(size):
+            best = max(range(pivot, size), key=lambda row: abs(augmented[row][pivot]))
+            if abs(augmented[best][pivot]) < 1e-10:
+                return None
+            augmented[pivot], augmented[best] = augmented[best], augmented[pivot]
+            divisor = augmented[pivot][pivot]
+            augmented[pivot] = [value / divisor for value in augmented[pivot]]
+            for row in range(size):
+                if row == pivot:
+                    continue
+                factor = augmented[row][pivot]
+                augmented[row] = [augmented[row][col] - factor * augmented[pivot][col]
+                                  for col in range(size + 1)]
+        return tuple(augmented[row][-1] for row in range(size))
+
+    def _fit_feature_mapping(self) -> bool:
+        if len(self.feature_samples) < 30:
+            return False
+        dimensions = len(self.feature_samples[0][0])
+        if dimensions == 0 or any(len(features) != dimensions
+                                  for features, _x, _y in self.feature_samples):
+            self.feature_mapping = None
+            return False
+        rows = [sample[0] for sample in self.feature_samples]
+        means = tuple(sum(row[index] for row in rows) / len(rows) for index in range(dimensions))
+        scales = tuple(max(1e-4, math.sqrt(sum((row[index] - means[index]) ** 2 for row in rows)
+                                           / len(rows))) for index in range(dimensions))
+        design = [[(features[index] - means[index]) / scales[index]
+                   for index in range(dimensions)] + [1.0]
+                  for features, _x, _y in self.feature_samples]
+        size = dimensions + 1
+        normal = [[sum(row[i] * row[j] for row in design) for j in range(size)]
+                  for i in range(size)]
+        # Ridge regularization reduces instability between correlated left/right eye features.
+        for index in range(dimensions):
+            normal[index][index] += 0.02 * len(design)
+        fitted = []
+        for target_index in (1, 2):
+            target = [sample[target_index] for sample in self.feature_samples]
+            rhs = [sum(row[index] * value for row, value in zip(design, target))
+                   for index in range(size)]
+            coefficients = self._solve_system(normal, rhs)
+            if coefficients is None:
+                self.feature_mapping = None
+                return False
+            fitted.append(coefficients)
+        self.feature_mean = means
+        self.feature_scale = scales
+        self.feature_mapping = (fitted[0], fitted[1])
+        return True
+
+    def _project_features(self, features: tuple[float, ...]) -> tuple[float, float] | None:
+        if self.feature_mapping is None or len(features) != len(self.feature_mean):
+            return None
+        normalized = tuple((value - mean) / scale
+                           for value, mean, scale in zip(features, self.feature_mean, self.feature_scale))
+        xfit, yfit = self.feature_mapping
+        x = sum(value * coefficient for value, coefficient in zip(normalized, xfit)) + xfit[-1]
+        y = sum(value * coefficient for value, coefficient in zip(normalized, yfit)) + yfit[-1]
+        return min(1.0, max(0.0, x)), min(1.0, max(0.0, y))
 
     @staticmethod
     def _solve(matrix: list[list[float]]) -> tuple[float, float, float] | None:
-        matrix = [row[:] for row in matrix]
-        for pivot in range(3):
-            best = max(range(pivot, 3), key=lambda i: abs(matrix[i][pivot]))
-            if abs(matrix[best][pivot]) < 1e-8:
-                return None
-            matrix[pivot], matrix[best] = matrix[best], matrix[pivot]
-            scale = matrix[pivot][pivot]
-            matrix[pivot] = [value / scale for value in matrix[pivot]]
-            for i in range(3):
-                if i == pivot:
-                    continue
-                factor = matrix[i][pivot]
-                matrix[i] = [matrix[i][j] - factor * matrix[pivot][j] for j in range(4)]
-        return matrix[0][3], matrix[1][3], matrix[2][3]
-
-    def _correct(self, gaze_x: float, gaze_y: float, yaw: float, pitch: float
-                 ) -> tuple[float, float]:
-        dyaw, dpitch = yaw - self.head_reference[0], pitch - self.head_reference[1]
-        return (gaze_x - self.head_coefficients_x[0] * dyaw - self.head_coefficients_x[1] * dpitch,
-                gaze_y - self.head_coefficients_y[0] * dyaw - self.head_coefficients_y[1] * dpitch)
+        solved = GazeCalibration._solve_system(
+            [row[:3] for row in matrix], [row[3] for row in matrix]
+        )
+        return solved if solved is None else (solved[0], solved[1], solved[2])
 
     def _refit(self) -> bool:
         if len(self.points) < 3:
             self.mapping = None
             return False
-        corrected = [self._correct(gx, gy, yaw, pitch)
-                     for gx, gy, yaw, pitch, _sx, _sy in self.points]
-        if (max(point[0] for point in corrected) - min(point[0] for point in corrected) < 0.015
-                or max(point[1] for point in corrected) - min(point[1] for point in corrected) < 0.015):
+        if (max(point[0] for point in self.points) - min(point[0] for point in self.points) < 0.015
+                or max(point[1] for point in self.points) - min(point[1] for point in self.points) < 0.015):
             self.mapping = None
             return False
         fits = []
-        for target_index in (4, 5):
+        for target_index in (2, 3):
             matrix = [[0.0] * 4 for _ in range(3)]
-            for row, (gx, gy) in zip(self.points, corrected):
-                v = [gx, gy, 1.0]
+            for row in self.points:
+                v = [row[0], row[1], 1.0]
                 target = row[target_index]
                 for i in range(3):
                     for j in range(3):
@@ -387,80 +467,15 @@ class GazeCalibration:
         self.mapping = (fits[0], fits[1])
         return True
 
-    @staticmethod
-    def fit_head_compensation(baseline_samples: list[tuple[float, float, float, float]],
-                              movement_samples: list[tuple[float, float, float, float]]):
-        """Fit eye-coordinate drift against head yaw/pitch while the user fixates center."""
-        if len(baseline_samples) < 8 or len(movement_samples) < 20:
-            return None
-        samples = baseline_samples + movement_samples
-        yaw_values = [row[2] for row in movement_samples]
-        pitch_values = [row[3] for row in movement_samples]
-        yaw_span = max(yaw_values) - min(yaw_values)
-        pitch_span = max(pitch_values) - min(pitch_values)
-        if max(yaw_span, pitch_span) < math.radians(8):
-            return None
-        ref_yaw = median(row[2] for row in baseline_samples)
-        ref_pitch = median(row[3] for row in baseline_samples)
-        predictors = [(row[2] - ref_yaw, row[3] - ref_pitch) for row in samples]
-        mean_yaw = sum(row[0] for row in predictors) / len(predictors)
-        mean_pitch = sum(row[1] for row in predictors) / len(predictors)
-        centered = [(a - mean_yaw, b - mean_pitch) for a, b in predictors]
-        var_yaw = sum(a * a for a, _ in centered)
-        var_pitch = sum(b * b for _, b in centered)
-        cov_pose = sum(a * b for a, b in centered)
-        determinant = var_yaw * var_pitch - cov_pose * cov_pose
-        two_axis = (var_yaw > 1e-8 and var_pitch > 1e-8
-                    and determinant > 0.08 * var_yaw * var_pitch)
-
-        def fit_axis(feature_index: int) -> tuple[float, float]:
-            values = [row[feature_index] for row in samples]
-            mean_value = sum(values) / len(values)
-            cov_yaw = sum(centered[i][0] * (values[i] - mean_value) for i in range(len(samples)))
-            cov_pitch = sum(centered[i][1] * (values[i] - mean_value) for i in range(len(samples)))
-            if two_axis:
-                beta_yaw = (cov_yaw * var_pitch - cov_pitch * cov_pose) / determinant
-                beta_pitch = (cov_pitch * var_yaw - cov_yaw * cov_pose) / determinant
-            elif var_yaw >= var_pitch:
-                beta_yaw, beta_pitch = cov_yaw / max(var_yaw, 1e-8), 0.0
-            else:
-                beta_yaw, beta_pitch = 0.0, cov_pitch / max(var_pitch, 1e-8)
-            return max(-2.5, min(2.5, beta_yaw)), max(-2.5, min(2.5, beta_pitch))
-
-        coefficients_x, coefficients_y = fit_axis(0), fit_axis(1)
-        baseline_x = median(row[0] for row in baseline_samples)
-        baseline_y = median(row[1] for row in baseline_samples)
-        raw_error = 0.0
-        corrected_error = 0.0
-        for gx, gy, yaw, pitch in movement_samples:
-            dyaw, dpitch = yaw - ref_yaw, pitch - ref_pitch
-            raw_error += (gx - baseline_x) ** 2 + (gy - baseline_y) ** 2
-            corrected_x = gx - coefficients_x[0] * dyaw - coefficients_x[1] * dpitch
-            corrected_y = gy - coefficients_y[0] * dyaw - coefficients_y[1] * dpitch
-            corrected_error += (corrected_x - baseline_x) ** 2 + (corrected_y - baseline_y) ** 2
-        count = 2 * len(movement_samples)
-        raw_drift = math.sqrt(raw_error / count)
-        corrected_drift = math.sqrt(corrected_error / count)
-        return (ref_yaw, ref_pitch, coefficients_x, coefficients_y,
-                raw_drift, corrected_drift)
-
-    def set_head_compensation(self, reference: tuple[float, float],
-                              coefficients_x: tuple[float, float],
-                              coefficients_y: tuple[float, float]) -> bool:
-        self.head_reference = reference
-        self.head_coefficients_x = coefficients_x
-        self.head_coefficients_y = coefficients_y
-        self.head_compensated = True
-        return self._refit()
-
-    def project(self, x: float, y: float, head_yaw: float | None = None,
-                head_pitch: float | None = None) -> tuple[float, float]:
+    def project(self, x: float, y: float,
+                features: tuple[float, ...] | None = None) -> tuple[float, float]:
+        if features is not None:
+            mapped = self._project_features(features)
+            if mapped is not None:
+                return mapped
         if not self.mapping:
             return (min(1.0, max(0.0, (x - 0.2) / 0.6)),
                     min(1.0, max(0.0, (y - 0.2) / 0.6)))
-        yaw = self.head_reference[0] if head_yaw is None else head_yaw
-        pitch = self.head_reference[1] if head_pitch is None else head_pitch
-        x, y = self._correct(x, y, yaw, pitch)
         xfit, yfit = self.mapping
         return (min(1.0, max(0.0, xfit[0] * x + xfit[1] * y + xfit[2])),
                 min(1.0, max(0.0, yfit[0] * x + yfit[1] * y + yfit[2])))

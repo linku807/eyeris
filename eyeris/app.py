@@ -27,10 +27,6 @@ class CommunicationBoard:
     CALIBRATION_SETTLE_SECONDS = 0.5
     CALIBRATION_CAPTURE_SECONDS = 1.5
     MIN_CALIBRATION_SAMPLES = 8
-    HEAD_BASELINE_SECONDS = 1.2
-    HEAD_CAPTURE_SECONDS = 6.0
-    MIN_HEAD_BASELINE_SAMPLES = 8
-    MIN_HEAD_MOVEMENT_SAMPLES = 20
 
     def __init__(self, root: tk.Tk, config: dict[str, Any]) -> None:
         self.root = root
@@ -62,10 +58,8 @@ class CommunicationBoard:
         self.calibrating = False
         self.calibration_index = 0
         self.calibration_started = 0.0
-        self.calibration_samples: list[tuple[float, float, float, float]] = []
-        self.calibration_phase = "points"
-        self.head_baseline_samples: list[tuple[float, float, float, float]] = []
-        self.head_movement_samples: list[tuple[float, float, float, float]] = []
+        self.calibration_samples: list[tuple[float, float]] = []
+        self.calibration_feature_samples: list[tuple[float, ...]] = []
         self.calibration_targets = [
             (0.08, 0.08), (0.50, 0.08), (0.92, 0.08),
             (0.92, 0.50), (0.92, 0.92), (0.50, 0.92),
@@ -126,13 +120,9 @@ class CommunicationBoard:
                                font=("Malgun Gothic", font_size, "bold"), width=cell_w * 0.82,
                                tags=(f"button-{index}",))
         if self.calibrating:
-            if self.calibration_phase == "points":
-                tx, ty = self.calibration_targets[self.calibration_index]
-                cx, cy = tx * width, ty * height
-                caption = f"노란 점을 바라보세요 · {self.calibration_index + 1}/{len(self.calibration_targets)}"
-            else:
-                cx, cy = width / 2, height / 2
-                caption = "가운데 점을 계속 보면서 머리를 천천히 좌우·위아래로 움직이세요"
+            tx, ty = self.calibration_targets[self.calibration_index]
+            cx, cy = tx * width, ty * height
+            caption = f"\ub178\ub780 \uc810\uc744 \ubc14\ub77c\ubcf4\uc138\uc694 - {self.calibration_index + 1}/{len(self.calibration_targets)}"
             canvas.create_oval(cx - 22, cy - 22, cx + 22, cy + 22, fill="#facc15", outline="white", width=4)
             canvas.create_text(width / 2, 30, text=caption, fill="white", font=("Malgun Gothic", 18, "bold"))
         if self.cursor_points:
@@ -183,9 +173,7 @@ class CommunicationBoard:
         if sample.x is not None and sample.y is not None:
             import time
             current_ms = int(time.monotonic() * 1000)
-            nx, ny = self.calibration.project(
-                sample.x, sample.y, sample.head_yaw, sample.head_pitch
-            )
+            nx, ny = self.calibration.project(sample.x, sample.y, sample.features)
             if self.status.get().startswith("카메라 연결 중"):
                 self.status.set(sample.message)
             width, height = self.canvas.winfo_width(), self.canvas.winfo_height()
@@ -200,10 +188,7 @@ class CommunicationBoard:
                 x, y = old_x * (1 - alpha) + x * alpha, old_y * (1 - alpha) + y * alpha
             self.cursor_points.append((x, y))
             if self.calibrating:
-                if self.calibration_phase == "points":
-                    self._collect_calibration(sample)
-                else:
-                    self._collect_head_calibration(sample)
+                self._collect_calibration(sample)
             elif self.mode == "keyboard":
                 self.selected = None
                 self.keyboard_target = self._keyboard_key_at(x, y)
@@ -338,96 +323,55 @@ class CommunicationBoard:
         self.gaze_window.clear()
         self.cursor_points.clear()
         self.calibrating = True
-        self.calibration_phase = "points"
         self.calibration_index = 0
         self.calibration_samples.clear()
-        self.head_baseline_samples.clear()
-        self.head_movement_samples.clear()
+        self.calibration_feature_samples.clear()
         import time
         self.calibration_started = time.monotonic()
-        self.status.set(f"시선 보정 1/{len(self.calibration_targets)} · 노란 점을 바라보세요")
+        self.status.set(f"\uc2dc\uc120 \ubcf4\uc815 1/{len(self.calibration_targets)} - \ub178\ub780 \uc810\uc744 \ubc14\ub77c\ubcf4\uc138\uc694")
 
     def _collect_calibration(self, sample) -> None:
         import time
         elapsed = time.monotonic() - self.calibration_started
         if elapsed < self.CALIBRATION_SETTLE_SECONDS:
             return
-        self.calibration_samples.append((
-            sample.x, sample.y, sample.head_yaw or 0.0, sample.head_pitch or 0.0
-        ))
+        self.calibration_samples.append((sample.x, sample.y))
+        if sample.features is not None:
+            self.calibration_feature_samples.append(sample.features)
         if elapsed < self.CALIBRATION_CAPTURE_SECONDS:
             return
         if len(self.calibration_samples) < self.MIN_CALIBRATION_SAMPLES:
             self.calibration_samples.clear()
+            self.calibration_feature_samples.clear()
             self.calibration_started = time.monotonic()
             self.status.set(
-                f"시선 보정 {self.calibration_index + 1}/{len(self.calibration_targets)} · "
-                "시선을 유지하고 다시 바라봐 주세요"
+                f"\uc2dc\uc120 \ubcf4\uc815 {self.calibration_index + 1}/{len(self.calibration_targets)} - "
+                "\uc2dc\uc120\uc744 \uc720\uc9c0\ud558\uace0 \ub2e4\uc2dc \ubc14\ub77c\ubd10 \uc8fc\uc138\uc694"
             )
             return
 
         gx = median(point[0] for point in self.calibration_samples)
         gy = median(point[1] for point in self.calibration_samples)
-        yaw = median(point[2] for point in self.calibration_samples)
-        pitch = median(point[3] for point in self.calibration_samples)
         tx, ty = self.calibration_targets[self.calibration_index]
-        self.calibration.add(gx, gy, tx, ty, yaw, pitch)
+        self.calibration.add(gx, gy, tx, ty)
+        self.calibration.add_feature_samples(self.calibration_feature_samples, tx, ty)
         self.calibration_index += 1
         self.calibration_samples.clear()
+        self.calibration_feature_samples.clear()
         if self.calibration_index >= len(self.calibration_targets):
-            if self.calibration.mapping is None:
-                self.calibrating = False
-                self.status.set("시선 보정 실패 · 점을 정확히 바라보고 다시 보정해 주세요")
-                return
-            self.calibration_phase = "head"
-            self.calibration_started = time.monotonic()
-            self.head_baseline_samples.clear()
-            self.head_movement_samples.clear()
-            self.status.set("가운데 점을 응시하고 머리를 정면으로 잠시 유지해 주세요")
+            self.calibrating = False
+            if self.calibration.feature_mapping is not None:
+                self.status.set("\uc2dc\uc120 \ubcf4\uc815 \uc644\ub8cc - \uc88c\uc6b0 \ub208\ub3d9\uc790\ub97c \uac01\uac01 \ubcf4\uc815\ud588\uc2b5\ub2c8\ub2e4")
+            elif self.calibration.mapping is not None:
+                self.status.set("\uc2dc\uc120 \ubcf4\uc815 \uc644\ub8cc")
+            else:
+                self.status.set("\uc2dc\uc120 \ubcf4\uc815 \uc2e4\ud328 - \ub2e4\uc2dc \ubcf4\uc815\ud574 \uc8fc\uc138\uc694")
             return
         self.calibration_started = time.monotonic()
         self.status.set(
-            f"시선 보정 {self.calibration_index + 1}/{len(self.calibration_targets)} · "
-            "노란 점을 바라보세요"
+            f"\uc2dc\uc120 \ubcf4\uc815 {self.calibration_index + 1}/{len(self.calibration_targets)} - "
+            "\ub178\ub780 \uc810\uc744 \ubc14\ub77c\ubcf4\uc138\uc694"
         )
-
-    def _collect_head_calibration(self, sample) -> None:
-        import time
-        if sample.wink or sample.head_yaw is None or sample.head_pitch is None:
-            return
-        elapsed = time.monotonic() - self.calibration_started
-        row = (sample.x, sample.y, sample.head_yaw, sample.head_pitch)
-        if elapsed < self.HEAD_BASELINE_SECONDS:
-            self.head_baseline_samples.append(row)
-            self.status.set("가운데 점을 보며 머리를 정면으로 유지해 주세요")
-            return
-        self.head_movement_samples.append(row)
-        self.status.set("가운데 점을 계속 보며 머리를 천천히 좌우·위아래로 움직여 주세요")
-        if elapsed < self.HEAD_BASELINE_SECONDS + self.HEAD_CAPTURE_SECONDS:
-            return
-
-        params = GazeCalibration.fit_head_compensation(
-            self.head_baseline_samples, self.head_movement_samples
-        )
-        self.calibrating = False
-        if params is None:
-            self.status.set("9점 시선 보정 완료 · 머리 움직임 데이터가 부족해 머리 보정은 적용되지 않았습니다")
-            return
-        raw_drift, corrected_drift = params[4], params[5]
-        if raw_drift < 0.004:
-            self.status.set("머리 회전에 따른 눈 좌표 변화가 거의 없어 추가 보정을 생략했습니다")
-            return
-        if corrected_drift >= raw_drift * 0.9:
-            self.status.set("머리 보정 데이터가 일관되지 않아 적용하지 않았습니다 · 정면에서 다시 보정해 주세요")
-            return
-        reference = (params[0], params[1])
-        fitted = self.calibration.set_head_compensation(reference, params[2], params[3])
-        if fitted:
-            self.status.set(
-                f"머리 보정 적용 · 보정 중 좌표 흔들림 {raw_drift:.3f} → {corrected_drift:.3f}"
-            )
-        else:
-            self.status.set("9점 시선 보정 완료 · 머리 보정 계산에 실패했습니다")
 
     def _toggle_fullscreen(self, _event=None) -> None:
         self.root.attributes("-fullscreen", not bool(self.root.attributes("-fullscreen")))
