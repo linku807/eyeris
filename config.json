@@ -1,5 +1,5 @@
 {
-  "grid": {"columns": 3, "rows": 3},
+  "grid": {"columns": 4, "rows": 3},
   "camera_index": 0,
   "blink_threshold": 0.19,
   "blink_debounce_ms": 1200,

@@ -9,7 +9,9 @@ from typing import Any
 
 from .actions import ActionRunner
 from .config import load_config
+from .dwell import DwellSelector
 from .gaze import GazeCalibration, GazeTracker
+from .keyboard import CheonjiinKeyboard, KEYS
 
 
 class CommunicationBoard:
@@ -22,10 +24,15 @@ class CommunicationBoard:
         self.config = config
         self.buttons: list[dict[str, Any]] = config["buttons"]
         self.columns = config["grid"]["columns"]
-        self.rows = config["grid"]["rows"]
+        self.rows = max(config["grid"]["rows"], math.ceil((len(self.buttons) + 1) / self.columns))
         self.tracker = GazeTracker(config.get("camera_index", 0), config.get("blink_threshold", 0.19))
         self.calibration = GazeCalibration()
         self.selected: int | None = None
+        self.mode = "board"
+        self.keyboard = CheonjiinKeyboard()
+        self.keyboard_target: str | None = None
+        self.keyboard_dwell = DwellSelector(1100)
+        self.board_dwell = DwellSelector(1100)
         self.last_blink = False
         self.last_click_ms = 0
         self.closing = False
@@ -53,6 +60,7 @@ class CommunicationBoard:
         tk.Label(header, textvariable=self.status, bg=self.BG, fg=self.MUTED, font=("Malgun Gothic", 12)).pack(side="left", padx=20)
         controls = tk.Frame(header, bg=self.BG)
         controls.pack(side="right")
+        tk.Button(controls, text="천지인 키보드", command=self._open_keyboard, font=("Malgun Gothic", 12), padx=12, pady=7).pack(side="left", padx=5)
         tk.Button(controls, text="시선 보정", command=self.start_calibration, font=("Malgun Gothic", 12), padx=12, pady=7).pack(side="left", padx=5)
         tk.Button(controls, text="종료 (Esc)", command=self._exit, font=("Malgun Gothic", 12), padx=12, pady=7).pack(side="left", padx=5)
 
@@ -68,10 +76,14 @@ class CommunicationBoard:
         canvas = self.canvas
         width, height = max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
         canvas.delete("all")
+        if self.mode == "keyboard":
+            self._draw_keyboard(width, height)
+            return
         gap = max(8, min(width, height) // 55)
         cell_w = (width - gap * (self.columns + 1)) / self.columns
         cell_h = (height - gap * (self.rows + 1)) / self.rows
-        for index, button in enumerate(self.buttons):
+        board_items = self.buttons + [{"label": "천지인 키보드\n시선으로 열기", "color": "#0f766e", "action": {"type": "keyboard"}}]
+        for index, button in enumerate(board_items):
             row, col = divmod(index, self.columns)
             x0, y0 = gap + col * (cell_w + gap), gap + row * (cell_h + gap)
             x1, y1 = x0 + cell_w, y0 + cell_h
@@ -83,6 +95,9 @@ class CommunicationBoard:
             canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=button["label"], fill="white",
                                font=("Malgun Gothic", font_size, "bold"), width=cell_w * 0.82,
                                tags=(f"button-{index}",))
+            if index == len(self.buttons) and self.board_dwell.progress:
+                progress_w = cell_w * self.board_dwell.progress
+                canvas.create_rectangle(x0, y1 - 8, x0 + progress_w, y1, fill="#fef08a", outline="")
         if self.calibrating:
             tx, ty = self.calibration_targets[self.calibration_index]
             cx, cy = tx * width, ty * height
@@ -94,11 +109,52 @@ class CommunicationBoard:
             canvas.create_oval(cx - 15, cy - 15, cx + 15, cy + 15, fill="#fef08a", outline="#111827", width=3)
             canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="#111827", outline="")
 
+    def _draw_keyboard(self, width: int, height: int) -> None:
+        canvas = self.canvas
+        preview_h = height * 0.25
+        canvas.create_rectangle(0, 0, width, preview_h, fill="#111c2e", outline="")
+        current_text = self.keyboard.text or "입력할 문장을 시선으로 작성하세요"
+        canvas.create_text(width * 0.04, preview_h * 0.43, anchor="w", text=current_text,
+                           fill=self.FG, font=("Malgun Gothic", max(22, min(48, int(preview_h * 0.22))), "bold"),
+                           width=width * 0.92)
+        progress = self.keyboard.vowel_progress
+        guide = f"모음 입력: {progress}" if progress else "키에 1.1초 시선을 두세요 · 자음 순환은 시선을 다른 곳에 뒀다가 같은 키로 돌아오세요"
+        canvas.create_text(width * 0.04, preview_h * 0.82, anchor="w", text=guide,
+                           fill=self.MUTED, font=("Malgun Gothic", 14))
+        gap = max(7, min(width, height) // 70)
+        grid_h = height - preview_h
+        cell_w = (width - gap * 5) / 4
+        cell_h = (grid_h - gap * 5) / 4
+        for index, key in enumerate(KEYS):
+            row, col = divmod(index, 4)
+            x0, y0 = gap + col * (cell_w + gap), preview_h + gap + row * (cell_h + gap)
+            x1, y1 = x0 + cell_w, y0 + cell_h
+            focused = key.id == self.keyboard_target
+            color = "#155e75" if key.kind in ("consonant", "vowel") else "#334155"
+            canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#fef08a" if focused else color,
+                                    width=7 if focused else 1)
+            font_size = max(16, min(36, int(cell_h / max(2.2, len(key.label) * 0.12))))
+            canvas.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=key.label, fill="white",
+                               font=("Malgun Gothic", font_size, "bold"), width=cell_w * 0.88)
+            if focused and self.keyboard_dwell.progress:
+                canvas.create_rectangle(x0, y1 - 8, x0 + cell_w * self.keyboard_dwell.progress, y1,
+                                        fill="#fef08a", outline="")
+        if self.calibrating:
+            tx, ty = self.calibration_targets[self.calibration_index]
+            canvas.create_oval(tx * width - 20, ty * height - 20, tx * width + 20, ty * height + 20,
+                               fill="#facc15", outline="white", width=4)
+        if self.cursor_points:
+            cx, cy = self.cursor_points[-1]
+            canvas.create_oval(cx - 15, cy - 15, cx + 15, cy + 15, fill="#fef08a", outline="#111827", width=3)
+            canvas.create_oval(cx - 4, cy - 4, cx + 4, cy + 4, fill="#111827", outline="")
+
     def _tick(self) -> None:
         if self.closing:
             return
         sample = self.tracker.latest()
         if sample.x is not None and sample.y is not None:
+            import time
+            current_ms = int(time.monotonic() * 1000)
             nx, ny = self.calibration.project(sample.x, sample.y)
             if self.status.get().startswith("카메라 연결 중"):
                 self.status.set(sample.message)
@@ -110,11 +166,21 @@ class CommunicationBoard:
             self.cursor_points.append((x, y))
             if self.calibrating:
                 self._collect_calibration(sample.x, sample.y)
+            elif self.mode == "keyboard":
+                self.selected = None
+                self.last_blink = False
+                self.keyboard_target = self._keyboard_key_at(x, y)
+                activated = self.keyboard_dwell.update(self.keyboard_target, current_ms)
+                if activated and self.keyboard_target:
+                    self._activate_keyboard_key(self.keyboard_target)
             else:
                 self.selected = self._nearest_button(x, y)
-                if sample.blink and not self.last_blink:
-                    import time
-                    current_ms = int(time.monotonic() * 1000)
+                if self.selected == len(self.buttons):
+                    if self.board_dwell.update("keyboard", current_ms):
+                        self._open_keyboard()
+                else:
+                    self.board_dwell.reset()
+                if self.selected is not None and self.selected < len(self.buttons) and sample.blink and not self.last_blink:
                     if current_ms - self.last_click_ms >= int(self.config.get("blink_debounce_ms", 1200)):
                         self.last_click_ms = current_ms
                         self._activate_selected()
@@ -123,6 +189,9 @@ class CommunicationBoard:
             self.last_blink = False
             self.cursor_points.clear()
             self.selected = None
+            self.board_dwell.reset()
+            self.keyboard_dwell.reset()
+            self.keyboard_target = None
             self.status.set(sample.message)
         while True:
             try:
@@ -137,7 +206,7 @@ class CommunicationBoard:
         col = min(self.columns - 1, max(0, int(x / width * self.columns)))
         row = min(self.rows - 1, max(0, int(y / height * self.rows)))
         index = row * self.columns + col
-        if index < len(self.buttons):
+        if index < len(self.buttons) + 1:
             return index
         # Empty grid slots should focus the closest real button instead of selecting nothing.
         target_x, target_y = x / width, y / height
@@ -148,10 +217,54 @@ class CommunicationBoard:
         return math.hypot(x - (col + 0.5) / self.columns, y - (row + 0.5) / self.rows)
 
     def _activate_selected(self) -> None:
-        if self.selected is not None and not self.calibrating:
+        if self.selected is None or self.calibrating:
+            return
+        if self.selected == len(self.buttons):
+            self._open_keyboard()
+        else:
             self.action_runner.run(self.buttons[self.selected])
 
+    def _open_keyboard(self) -> None:
+        self.mode = "keyboard"
+        self.board_dwell.reset()
+        self.keyboard_dwell.reset()
+        self.keyboard_target = None
+        self.status.set("천지인 키보드 · 키에 시선을 1.1초 두세요")
+
+    def _keyboard_key_at(self, x: float, y: float) -> str | None:
+        width, height = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        preview_h = height * 0.25
+        if y < preview_h:
+            return None
+        gap = max(7, min(width, height) // 70)
+        col = min(3, max(0, int(x / width * 4)))
+        row = min(3, max(0, int((y - preview_h) / (height - preview_h) * 4)))
+        return KEYS[row * 4 + col].id
+
+    def _activate_keyboard_key(self, key_id: str) -> None:
+        event, value = self.keyboard.activate(key_id)
+        if event == "input":
+            self.status.set(f"입력: {value}")
+        elif event == "speak":
+            text = self.keyboard.take_text()
+            if text.strip():
+                self.action_runner.run({"label": "키보드 음성 출력", "action": {"type": "sound", "text": text}})
+            else:
+                self.status.set("먼저 문장을 입력하세요")
+        elif event == "discord":
+            text = self.keyboard.take_text()
+            if text.strip():
+                self.action_runner.run({"label": "키보드 Discord 전송", "action": {"type": "discord", "message": text}})
+            else:
+                self.status.set("먼저 문장을 입력하세요")
+        elif event == "board":
+            self.mode = "board"
+            self.keyboard_dwell.reset()
+            self.status.set("의사소통 보드")
+        self._draw()
+
     def start_calibration(self) -> None:
+        self.mode = "board"
         self.calibration = GazeCalibration()
         self.calibrating = True
         self.calibration_index = 0
