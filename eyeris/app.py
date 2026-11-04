@@ -413,10 +413,19 @@ class CommunicationBoard:
         if params is None:
             self.status.set("9점 시선 보정 완료 · 머리 움직임 데이터가 부족해 머리 보정은 적용되지 않았습니다")
             return
+        raw_drift, corrected_drift = params[4], params[5]
+        if raw_drift < 0.004:
+            self.status.set("머리 회전에 따른 눈 좌표 변화가 거의 없어 추가 보정을 생략했습니다")
+            return
+        if corrected_drift >= raw_drift * 0.9:
+            self.status.set("머리 보정 데이터가 일관되지 않아 적용하지 않았습니다 · 정면에서 다시 보정해 주세요")
+            return
         reference = (params[0], params[1])
         fitted = self.calibration.set_head_compensation(reference, params[2], params[3])
         if fitted:
-            self.status.set("시선 및 개인별 머리 움직임 보정 완료")
+            self.status.set(
+                f"머리 보정 적용 · 보정 중 좌표 흔들림 {raw_drift:.3f} → {corrected_drift:.3f}"
+            )
         else:
             self.status.set("9점 시선 보정 완료 · 머리 보정 계산에 실패했습니다")
 

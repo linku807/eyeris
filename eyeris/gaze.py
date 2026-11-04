@@ -427,7 +427,22 @@ class GazeCalibration:
                 beta_yaw, beta_pitch = 0.0, cov_pitch / max(var_pitch, 1e-8)
             return max(-2.5, min(2.5, beta_yaw)), max(-2.5, min(2.5, beta_pitch))
 
-        return (ref_yaw, ref_pitch, fit_axis(0), fit_axis(1))
+        coefficients_x, coefficients_y = fit_axis(0), fit_axis(1)
+        baseline_x = median(row[0] for row in baseline_samples)
+        baseline_y = median(row[1] for row in baseline_samples)
+        raw_error = 0.0
+        corrected_error = 0.0
+        for gx, gy, yaw, pitch in movement_samples:
+            dyaw, dpitch = yaw - ref_yaw, pitch - ref_pitch
+            raw_error += (gx - baseline_x) ** 2 + (gy - baseline_y) ** 2
+            corrected_x = gx - coefficients_x[0] * dyaw - coefficients_x[1] * dpitch
+            corrected_y = gy - coefficients_y[0] * dyaw - coefficients_y[1] * dpitch
+            corrected_error += (corrected_x - baseline_x) ** 2 + (corrected_y - baseline_y) ** 2
+        count = 2 * len(movement_samples)
+        raw_drift = math.sqrt(raw_error / count)
+        corrected_drift = math.sqrt(corrected_error / count)
+        return (ref_yaw, ref_pitch, coefficients_x, coefficients_y,
+                raw_drift, corrected_drift)
 
     def set_head_compensation(self, reference: tuple[float, float],
                               coefficients_x: tuple[float, float],

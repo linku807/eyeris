@@ -3,7 +3,7 @@
   "camera_index": 0,
   "blink_threshold": 0.19,
   "blink_debounce_ms": 1200,
-  "discord": {"webhook_url": "https://discord.com/api/webhooks/1554811541822505010/JMYQCUMXXxGce1YjC9gTiAS7eGUAzMY64R_lS0yAwRMJ926Rnp6T0JdAN8sQbtRqSWSn"},
+  "discord": {"webhook_url": ""},
   "buttons": [
     {"label": "안녕하세요", "color": "#2563eb", "action": {"type": "sound", "text": "안녕하세요"}},
     {"label": "네", "color": "#0891b2", "action": {"type": "sound", "text": "네"}},
