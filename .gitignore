@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+config.local.json
+config.json
+.vscode/
+Microsoft/
